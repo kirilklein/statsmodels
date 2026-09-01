@@ -33,8 +33,10 @@ from statsmodels.compat.pandas import Substitution
 import numpy as np
 from scipy.linalg import block_diag
 
-from statsmodels.regression.linear_model import WLS
+from statsmodels.genmod.generalized_linear_model import GLM
+from statsmodels.regression.linear_model import WLS, RegressionModel
 from statsmodels.sandbox.regression.gmm import GMM
+from statsmodels.stats._delta_method import NonlinearDeltaCov
 from statsmodels.stats.contrast import ContrastResults
 from statsmodels.tools.docstring import indent
 
@@ -184,7 +186,10 @@ def _mom_ols_te(tm, endog, tind, prob, weighted=True):
 
 def _mom_olsex(params, model=None, exog=None, scale=None):
     """
-    Moment condition for OLS with an optionally external exog and scale
+    Score moment condition of the outcome model
+
+    Uses ``model.score_obs`` if the model provides it, otherwise the OLS
+    score with an optionally external exog and scale.
 
     Parameters
     ----------
@@ -205,6 +210,8 @@ def _mom_olsex(params, model=None, exog=None, scale=None):
     ndarray
         Moment condition, evaluated at each observation, weighted by exog.
     """
+    if exog is None and hasattr(model, "score_obs"):
+        return model.score_obs(params)
     exog = exog if exog is not None else model.exog
     fitted = model.predict(params, exog)
     resid = model.endog - fitted
@@ -212,6 +219,22 @@ def _mom_olsex(params, model=None, exog=None, scale=None):
         resid /= scale
     mom = resid[:, None] * exog
     return mom
+
+
+def _resid(results):
+    return results.model.endog - results.fittedvalues
+
+
+def _fit_weighted(model, endog, exog, weights):
+    """Fit outcome model of the same type as `model` with case weights"""
+    if isinstance(model, GLM):
+        mod = GLM(endog, exog, family=model.family, var_weights=weights)
+    elif isinstance(model, RegressionModel):
+        mod = WLS(endog, exog, weights=weights)
+    else:
+        raise NotImplementedError("weighted outcome regression requires an "
+                                  "OLS or GLM outcome model")
+    return mod.fit(cov_type="HC1")
 
 
 def ate_ipw(endog, tind, prob, weighted=True, probt=None):
@@ -732,6 +755,46 @@ class TreatmentEffectResults(ContrastResults):
 
         self.c_names = ["ATE", "POM0", "POM1"]
 
+    def _pom_delta(self, func):
+        params = self.results_gmm.params[:2]
+        cov = self.results_gmm.cov_params()[:2, :2]
+        return NonlinearDeltaCov(func, params, cov)
+
+    def risk_ratio(self):
+        """
+        Ratio of potential outcome means, POM1 / POM0
+
+        Inference is based on the delta method applied to the GMM estimates
+        of ATE and POM0.
+
+        Returns
+        -------
+        NonlinearDeltaCov
+            Instance with ``predicted``, ``se_vectorized``, ``conf_int`` and
+            ``summary`` methods.
+        """
+        return self._pom_delta(lambda p: np.atleast_1d((p[0] + p[1]) / p[1]))
+
+    def odds_ratio(self):
+        """
+        Odds ratio of potential outcome means for a binary outcome
+
+        The odds ratio is ``POM1 / (1 - POM1) / (POM0 / (1 - POM0))``.
+        Inference is based on the delta method applied to the GMM estimates
+        of ATE and POM0.
+
+        Returns
+        -------
+        NonlinearDeltaCov
+            Instance with ``predicted``, ``se_vectorized``, ``conf_int`` and
+            ``summary`` methods.
+        """
+        def func(p):
+            pom0 = p[1]
+            pom1 = p[0] + p[1]
+            return np.atleast_1d(pom1 / (1 - pom1) / (pom0 / (1 - pom0)))
+        return self._pom_delta(func)
+
 
 doc_params_returns = """\
 Parameters
@@ -804,9 +867,13 @@ class TreatmentEffect:
 
     Notes
     -----
-    The outcome model is currently limited to a linear model based on OLS.
-    Other outcome models, like Logit and Poisson, will become available in
-    future.
+    The outcome model can be a linear model based on OLS or a GLM, e.g.
+    ``GLM(endog, exog, family=Binomial())`` for a binary outcome with
+    logit link. The GLM family, including its link, is used for the outcome
+    regression by treatment group. Potential outcome means and the
+    treatment effect are on the scale of the mean of endog, i.e. the ATE
+    is a risk difference for a binary outcome. ``TreatmentEffectResults``
+    provides ``risk_ratio`` and ``odds_ratio`` for ratio effects.
 
     See `Treatment Effect notebook
     <../examples/notebooks/generated/treatment_effect.html>`__
@@ -832,10 +899,17 @@ class TreatmentEffect:
         self.nobs = endog.shape[0]
         self._cov_type = _cov_type
 
-        # no init keys are supported
-        mod0 = model.__class__(endog[~treat_mask], exog[~treat_mask])
+        init_kwds = {}
+        if isinstance(model, GLM):
+            if model.offset is not None or model.exposure is not None:
+                raise NotImplementedError("offset and exposure in the outcome "
+                                          "model are not supported")
+            init_kwds["family"] = model.family
+        mod0 = model.__class__(endog[~treat_mask], exog[~treat_mask],
+                               **init_kwds)
         self.results0 = mod0.fit(cov_type=_cov_type)
-        mod1 = model.__class__(endog[treat_mask], exog[treat_mask])
+        mod1 = model.__class__(endog[treat_mask], exog[treat_mask],
+                               **init_kwds)
         self.results1 = mod1.fit(cov_type=_cov_type)
         # self.predict_mean0 = self.model_pool.predict(self.results0.params
         #                                             ).mean()
@@ -1019,8 +1093,10 @@ class TreatmentEffect:
         prob = self.prob_select
         tind = self.treatment
         exog = self.model_pool.exog  # in original order
-        correct0 = (self.results0.resid / (1 - prob[tind == 0])).sum() / nobs
-        correct1 = (self.results1.resid / (prob[tind == 1])).sum() / nobs
+        resid0 = _resid(self.results0)
+        resid1 = _resid(self.results1)
+        correct0 = (resid0 / (1 - prob[tind == 0])).sum() / nobs
+        correct1 = (resid1 / (prob[tind == 1])).sum() / nobs
         tmean0 = self.results0.predict(exog).mean() + correct0
         tmean1 = self.results1.predict(exog).mean() + correct1
         ate = tmean1 - tmean0
@@ -1070,22 +1146,20 @@ class TreatmentEffect:
         treat_mask = self.treat_mask
 
         ww1 = tind / prob * (tind / prob - 1)
-        mod1 = WLS(endog[treat_mask], exog[treat_mask],
-                   weights=ww1[treat_mask])
-        result1 = mod1.fit(cov_type="HC1")
+        result1 = _fit_weighted(self.model_pool, endog[treat_mask],
+                                exog[treat_mask], ww1[treat_mask])
         mean1_ipw2 = result1.predict(exog).mean()
 
         ww0 = (1 - tind) / (1 - prob) * ((1 - tind) / (1 - prob) - 1)
-        mod0 = WLS(endog[~treat_mask], exog[~treat_mask],
-                   weights=ww0[~treat_mask])
-        result0 = mod0.fit(cov_type="HC1")
+        result0 = _fit_weighted(self.model_pool, endog[~treat_mask],
+                                exog[~treat_mask], ww0[~treat_mask])
         mean0_ipw2 = result0.predict(exog).mean()
 
         self.results_ipwwls0 = result0
         self.results_ipwwls1 = result1
 
-        correct0 = (result0.resid / (1 - prob[tind == 0])).sum() / nobs
-        correct1 = (result1.resid / (prob[tind == 1])).sum() / nobs
+        correct0 = (_resid(result0) / (1 - prob[tind == 0])).sum() / nobs
+        correct1 = (_resid(result1) / (prob[tind == 1])).sum() / nobs
         tmean0 = mean0_ipw2 + correct0
         tmean1 = mean1_ipw2 + correct1
         ate = tmean1 - tmean0
@@ -1149,15 +1223,13 @@ class TreatmentEffect:
         else:
             raise ValueError("incorrect option for effect_group")
 
-        mod0 = WLS(endog[~treat_mask], exog[~treat_mask],
-                   weights=w0)
-        result0 = mod0.fit(cov_type="HC1")
+        result0 = _fit_weighted(self.model_pool, endog[~treat_mask],
+                                exog[~treat_mask], w0)
         # mean0_ipwra = (result0.predict(exog) * (prob / prob.mean())).mean()
         mean0_ipwra = result0.predict(exogt).mean()
 
-        mod1 = WLS(endog[treat_mask], exog[treat_mask],
-                   weights=w1)
-        result1 = mod1.fit(cov_type="HC1")
+        result1 = _fit_weighted(self.model_pool, endog[treat_mask],
+                                exog[treat_mask], w1)
         # mean1_ipwra = (result1.predict(exog) * (prob / prob.mean())).mean()
         mean1_ipwra = result1.predict(exogt).mean()
 

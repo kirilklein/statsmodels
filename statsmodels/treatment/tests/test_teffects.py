@@ -11,7 +11,9 @@ from numpy.testing import assert_allclose
 import pandas as pd
 import pytest
 
-from statsmodels.discrete.discrete_model import Probit
+from statsmodels.discrete.discrete_model import Logit, Probit
+from statsmodels.genmod import families
+from statsmodels.genmod.generalized_linear_model import GLM
 from statsmodels.regression.linear_model import OLS
 from statsmodels.treatment.treatment_effects import TreatmentEffect
 
@@ -150,3 +152,100 @@ def test_select_params_not_six(meth):
     res0 = getattr(teff, meth)(return_results=True)
     assert_allclose(res1, res0.effect, rtol=1e-12)
     assert_allclose(res0.start_params, res0.results_gmm.params, rtol=1e-12)
+
+
+class TestTEffectsGLM:
+    # binary outcome with logit outcome model, no Stata reference values
+
+    @classmethod
+    def setup_class(cls):
+        formula_outcome = "lbweight ~ prenatal1_ + mmarried_ + mage + fbaby_"
+        mod = GLM.from_formula(formula_outcome, dta_cat,
+                               family=families.Binomial())
+        cls.tind = np.asarray(dta_cat["mbsmoke_"])
+        cls.teff = TreatmentEffect(mod, cls.tind, results_select=res_probit)
+
+    def test_family(self):
+        assert isinstance(self.teff.results0.model.family, families.Binomial)
+        assert isinstance(self.teff.results1.model.family, families.Binomial)
+
+    @pytest.mark.parametrize("meth", ["ra", "ipw", "aipw", "aipw_wls",
+                                      "ipw_ra"])
+    def test_consistency(self, meth):
+        res1 = getattr(self.teff, meth)(return_results=False)
+        res0 = getattr(self.teff, meth)(return_results=True)
+        assert_allclose(res1, res0.effect, rtol=1e-12)
+        assert_allclose(res0.start_params, res0.results_gmm.params,
+                        rtol=1e-12)
+        assert np.all((res0.effect[1:] > 0) & (res0.effect[1:] < 1))
+
+    def test_ra_gcomputation(self):
+        # RA with a GLM outcome model is g-computation
+        exog = self.teff.model_pool.exog
+        y = self.teff.model_pool.endog
+        pom = [GLM(y[self.tind == k], exog[self.tind == k],
+                   family=families.Binomial()).fit().predict(exog).mean()
+               for k in (0, 1)]
+        _, pom0, pom1 = self.teff.ra(return_results=False)
+        assert_allclose([pom0, pom1], pom, rtol=1e-10)
+
+    def test_logit_outcome_model(self):
+        # discrete Logit as outcome model gives the same RA as GLM Binomial
+        mod = Logit.from_formula(
+            "lbweight ~ prenatal1_ + mmarried_ + mage + fbaby_", dta_cat)
+        res = TreatmentEffect(mod, self.tind, results_select=res_probit).ra()
+        res_glm = self.teff.ra()
+        assert_allclose(res.effect, res_glm.effect, rtol=1e-8)
+        assert_allclose(res.sd, res_glm.sd, rtol=1e-6)
+
+    def test_ipw_outcome_model_invariant(self):
+        mod_ols = OLS.from_formula(
+            "lbweight ~ prenatal1_ + mmarried_ + mage + fbaby_", dta_cat)
+        res_ols = TreatmentEffect(mod_ols, self.tind,
+                                  results_select=res_probit).ipw()
+        res = self.teff.ipw()
+        assert_allclose(res.effect, res_ols.effect, rtol=1e-12)
+        assert_allclose(res.sd, res_ols.sd, rtol=1e-8)
+
+
+def test_glm_ra_influence_function():
+    # RA with logit outcome model: compare GMM standard errors of POM, ATE,
+    # risk ratio and odds ratio with the analytic influence function
+    # (delta method for g-computation)
+    formula_outcome = "lbweight ~ prenatal1_ + mmarried_ + mage + fbaby_"
+    mod = GLM.from_formula(formula_outcome, dta_cat,
+                           family=families.Binomial())
+    tind = np.asarray(dta_cat["mbsmoke_"])
+    res = TreatmentEffect(mod, tind, results_select=res_probit).ra()
+
+    y, x = mod.endog, mod.exog
+    nobs = len(y)
+    pom, infl = [], []
+    for k in (0, 1):
+        mask = tind == k
+        mu = GLM(y[mask], x[mask], family=families.Binomial()).fit().predict(x)
+        pom.append(mu.mean())
+        score = np.zeros_like(x)
+        score[mask] = (y[mask] - mu[mask])[:, None] * x[mask]
+        hess = -(x[mask] * (mu[mask] * (1 - mu[mask]))[:, None]).T @ x[mask]
+        jac = (x * (mu * (1 - mu))[:, None]).mean(0)
+        infl.append((mu - pom[-1]) / nobs - score @ np.linalg.solve(hess, jac))
+    infl = np.column_stack(infl)
+    cov = infl.T @ infl
+    m0, m1 = pom
+    var_ate = cov[0, 0] + cov[1, 1] - 2 * cov[0, 1]
+    assert_allclose(res.effect, [m1 - m0, m0, m1], rtol=1e-10)
+    assert_allclose(res.sd, np.sqrt([var_ate, cov[0, 0], cov[1, 1]]),
+                    rtol=1e-5)
+
+    rr = res.risk_ratio()
+    grad = np.array([-m1 / m0**2, 1 / m0])
+    assert_allclose(rr.predicted(), m1 / m0, rtol=1e-10)
+    assert_allclose(rr.se_vectorized(), np.sqrt(grad @ cov @ grad), rtol=1e-5)
+
+    odds = res.odds_ratio()
+    or_ = m1 / (1 - m1) / (m0 / (1 - m0))
+    grad = np.array([-or_ / (m0 * (1 - m0)), or_ / (m1 * (1 - m1))])
+    assert_allclose(odds.predicted(), or_, rtol=1e-10)
+    assert_allclose(odds.se_vectorized(), np.sqrt(grad @ cov @ grad),
+                    rtol=1e-5)
